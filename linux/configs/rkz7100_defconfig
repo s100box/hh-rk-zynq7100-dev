@@ -1,0 +1,152 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Howard M. Harte
+#
+# Buildroot configuration for the RK-ZYNQ7100 (XC7Z100-2FFG900).
+#
+# Buildroot, the Xilinx kernel and U-Boot forks, and U-Boot SPL in place of
+# the Vitis FSBL. Board specifics come from ../board/.
+#
+# Paths marked @...@ are rewritten by ../build.sh.
+
+BR2_arm=y
+BR2_cortex_a9=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_ENABLE_VFP=y
+BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_6=y
+BR2_GLOBAL_PATCH_DIR="board/xilinx/patches"
+BR2_DOWNLOAD_FORCE_CHECK_HASHES=y
+BR2_ROOTFS_POST_BUILD_SCRIPT="@BOARD@/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="@BOARD@/post-image.sh"
+
+# --- kernel: Xilinx linux-xlnx 6.6.70 LTS -------------------------------
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_TARBALL=y
+BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION="$(call github,Xilinx,linux-xlnx,xlnx_rebase_v6.6_LTS_merge_6.6.70)/xlnx_rebase_v6.6_LTS_merge_6.6.70.tar.gz"
+BR2_LINUX_KERNEL_DEFCONFIG="xilinx_zynq"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="@BOARD@/linux-rkz7100.fragment"
+BR2_LINUX_KERNEL_UIMAGE=y
+BR2_LINUX_KERNEL_UIMAGE_LOADADDR="0x8000"
+# The kernel and DTBs also go into the rootfs /boot, which is what an eMMC
+# boot loads them from through extlinux (see board/post-build.sh); an SD card
+# boots the copies on its FAT partition.
+BR2_LINUX_KERNEL_INSTALL_TARGET=y
+BR2_LINUX_KERNEL_DTS_SUPPORT=y
+# Three trees: the default, USB0 as a device on USB-C instead of a host on
+# USB-A, and the HDMI capture pipeline. The last one names a VDMA in the PL,
+# so boot it ONLY with the bitstream that has one -- probing a PL address
+# nothing answers hangs the CPU with no console and no way back.
+BR2_LINUX_KERNEL_CUSTOM_DTS_PATH="@BOARD@/zynq-rkz7100.dts @BOARD@/zynq-rkz7100-usbdev.dts @BOARD@/zynq-rkz7100-hdmirx.dts"
+BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
+# The ADV7611 reports MEDIA_BUS_FMT_RGB888_1X24, which the Xilinx VIP format
+# table does not carry, so VIDIOC_STREAMON fails on an otherwise correct
+# pipeline. board/patches/linux/: 0001 adds that format; 0002 makes adv7604
+# poll its status registers, because this board leaves INT1 unconnected and
+# CEC transmits otherwise time out.
+BR2_LINUX_KERNEL_PATCH="@BOARD@/patches/linux"
+
+# --- U-Boot: Xilinx u-boot-xlnx 2024.01 ---------------------------------
+BR2_TARGET_UBOOT=y
+BR2_TARGET_UBOOT_BUILD_SYSTEM_KCONFIG=y
+BR2_TARGET_UBOOT_CUSTOM_TARBALL=y
+BR2_TARGET_UBOOT_CUSTOM_TARBALL_LOCATION="$(call github,Xilinx,u-boot-xlnx,xlnx_rebase_v2024.01_2024.2)/xlnx_rebase_v2024.01_2024.2.tar.gz"
+BR2_TARGET_UBOOT_BOARD_DEFCONFIG="xilinx_zynq_virt"
+BR2_TARGET_UBOOT_CONFIG_FRAGMENT_FILES="@UBOOT_FRAGMENT@"
+BR2_TARGET_UBOOT_NEEDS_DTC=y
+BR2_TARGET_UBOOT_NEEDS_OPENSSL=y
+BR2_TARGET_UBOOT_NEEDS_GNUTLS=y
+# u-boot.bin is what JTAG boot loads; u-boot.img is what SPL loads from SD/QSPI.
+BR2_TARGET_UBOOT_FORMAT_BIN=y
+BR2_TARGET_UBOOT_FORMAT_IMG=y
+BR2_TARGET_UBOOT_SPL=y
+BR2_TARGET_UBOOT_SPL_NAME="spl/boot.bin"
+BR2_TARGET_UBOOT_CUSTOM_MAKEOPTS="DEVICE_TREE=zynq-rkz7100"
+BR2_PACKAGE_HOST_UBOOT_TOOLS=y
+
+# --- root filesystems ---------------------------------------------------
+# The TFTP ramdisk: gzipped cpio wrapped for bootm. Buildroot's own /init in a
+# cpio mounts devtmpfs before exec'ing /sbin/init, so /dev is populated on a
+# ramdisk boot.
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+BR2_TARGET_ROOTFS_CPIO_UIMAGE=y
+# The ext4 root for the SD card image and the eMMC.
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="512M"
+BR2_PACKAGE_HOST_DOSFSTOOLS=y
+BR2_PACKAGE_HOST_GENIMAGE=y
+BR2_PACKAGE_HOST_MTOOLS=y
+
+# --- userland: enough to exercise every PS peripheral by hand -----------
+#
+# ⚠ Buildroot DROPS a defconfig symbol whose dependencies are unmet, silently.
+# Without the two lines below, bash, i2c-tools and usbutils vanish from the
+# resolved .config with no message. build.sh checks that every symbol here
+# survived into .config.
+#   * bash and i2c-tools sit behind BR2_PACKAGE_BUSYBOX_SHOW_OTHERS (they
+#     replace BusyBox applets).
+#   * usbutils needs udev (for the hardware database lsusb names devices from).
+BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV=y
+BR2_SYSTEM_DHCP="eth0"
+BR2_TARGET_GENERIC_HOSTNAME="rkz7100"
+BR2_TARGET_GENERIC_ISSUE="RK-ZYNQ7100 (XC7Z100)"
+BR2_SYSTEM_BIN_SH_BASH=y
+BR2_PACKAGE_BASH=y
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_ETHTOOL=y
+BR2_PACKAGE_IPERF3=y
+BR2_PACKAGE_MTD=y
+BR2_PACKAGE_MMC_UTILS=y
+BR2_PACKAGE_I2C_TOOLS=y
+BR2_PACKAGE_USBUTILS=y
+BR2_PACKAGE_E2FSPROGS=y
+# resize2fs is NOT part of e2fsprogs by default in Buildroot, and without it
+# the eMMC root stays the size of rootfs.ext4 (512 MiB of a 7.3 GiB partition).
+BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y
+BR2_PACKAGE_DOSFSTOOLS=y
+BR2_PACKAGE_DOSFSTOOLS_MKFS_FAT=y
+BR2_PACKAGE_DOSFSTOOLS_FSCK_FAT=y
+BR2_PACKAGE_DOSFSTOOLS_FATLABEL=y
+BR2_PACKAGE_FIO=y
+BR2_PACKAGE_EVTEST=y
+BR2_PACKAGE_STRACE=y
+BR2_PACKAGE_HTOP=y
+BR2_PACKAGE_NANO=y
+BR2_PACKAGE_FILE=y
+BR2_PACKAGE_SCREEN=y
+BR2_PACKAGE_RSYNC=y
+# `sensors` reads the XADC die temperature and the fan through hwmon.
+BR2_PACKAGE_LM_SENSORS=y
+BR2_PACKAGE_LM_SENSORS_SENSORS=y
+# fancontrol is the stock temperature-driven fan loop; pwmconfig is what
+# writes its configuration by stepping the PWM and watching the tachometer.
+BR2_PACKAGE_LM_SENSORS_FANCONTROL=y
+BR2_PACKAGE_LM_SENSORS_PWMCONFIG=y
+# MDIO register access: phytool goes through a netdev (eth0 and PHY1, eth1
+# and PHY2); mdio-tools talks to an MDIO bus directly.
+BR2_PACKAGE_PHYTOOL=y
+BR2_PACKAGE_MDIO_TOOLS=y
+# libgpiod for the 40-pin header: gpioinfo/gpioget/gpioset drive the character
+# device, which is the interface that is actually maintained. The legacy
+# /sys/class/gpio still works and needs no package, but it cannot hold a line
+# (the pin reverts when the exporting process exits) and it has no line names.
+BR2_PACKAGE_LIBGPIOD=y
+BR2_PACKAGE_LIBGPIOD_TOOLS=y
+
+# --- V4L2, for the HDMI capture pipeline --------------------------------
+# v4l2-ctl queries the device and the detected DV timings; media-ctl prints
+# and edits the pipeline graph, which is how you tell "the ADV7611 did not
+# bind" apart from "the ADV7611 sees no signal".
+#
+# ⚠ v4l-utils is C++, so the toolchain needs libstdc++. The symbol to set is
+# BR2_TOOLCHAIN_BUILDROOT_CXX -- BR2_INSTALL_LIBSTDCPP is a `bool` with no
+# prompt that other symbols `select`, so setting it in a defconfig does
+# nothing and it never appears in the resolved .config. build.sh's
+# dropped-symbol check reports that.
+#
+# ⚠ It changes the toolchain, which invalidates every package: a full
+# rebuild, not an incremental one.
+BR2_TOOLCHAIN_BUILDROOT_CXX=y
+BR2_PACKAGE_LIBV4L=y
+BR2_PACKAGE_LIBV4L_UTILS=y

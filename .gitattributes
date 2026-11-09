@@ -1,0 +1,28 @@
+# Every text file is LF, in the repository and in the working tree, whatever
+# core.autocrlf says; the rules below name the files where that matters most.
+* text=auto eol=lf
+*.csv       text eol=lf
+
+*.md        text eol=lf
+*.xdc       text eol=lf
+*.pdf       binary
+*.sh        text eol=lf
+*.tcl       text eol=lf
+*.c         text eol=lf
+*.h         text eol=lf
+*.dts       text eol=lf
+*.cmd       text eol=lf
+*.cfg       text eol=lf
+*.conf      text eol=lf
+*.fragment  text eol=lf
+*.v         text eol=lf
+*.sv        text eol=lf
+*.py        text eol=lf
+*.prj       text eol=lf
+*_defconfig text eol=lf
+# A kernel patch Buildroot applies on a Linux host. CRLF here does not just
+# look wrong -- `patch` treats the carriage returns as part of the context
+# and the hunk fails to apply.
+*.patch     text eol=lf
+# An init script the board runs: no extension, same rule.
+S15fpga     text eol=lf

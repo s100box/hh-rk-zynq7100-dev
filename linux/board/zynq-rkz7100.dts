@@ -1,0 +1,730 @@
+// SPDX-License-Identifier: GPL-2.0
+// SPDX-FileCopyrightText: 2026 Howard M. Harte
+/*
+ * RK-ZYNQ7100 (XC7Z100-2FFG900) device tree: the PS peripherals and the PL-pin
+ * devices the PL bitstream hands to the PS.
+ *
+ * Pin assignment: the vendor schematic, sheet 2, and the tested PS7
+ * configuration in board/ps7_config.tcl (from R0Y00/rk-zynq7100-fmcomms2-linux).
+ * See ../../doc/RK_ZYNQ7100_User_Guide.md section 7.
+ *
+ *   MIO0-13    QSPI, dual parallel: 2x W25Q256FV = 64 MiB
+ *   MIO7       USB PHY RESETB (through a diode; also a boot strap)
+ *   MIO14/15   UART0 RX/TX      FT2232HQ channel B: the console
+ *   MIO16-27   ENET0 RGMII      RTL8211F-CG "PHY1", address 1, 1.8 V I/O
+ *   MIO28-39   USB0 ULPI        USB3320 -> USB-A (host) and USB-C (device)
+ *   MIO40-45   SD0              microSD through a TXS02612 translator
+ *   MIO46-51   SD1              KLM8G1GETF-B041 8 GB eMMC, 4-bit
+ *   MIO52/53   ENET0 MDC/MDIO
+ *
+ * MIO bank 500 is 3.3 V, bank 501 is 1.8 V. PS_CLK is 33.333 MHz.
+ * The PL-pin nodes below (GEM1, I2C, LEDs, keys, fan, BIST) work only with a
+ * bitstream loaded; HDMI and camera capture are in zynq-rkz7100-hdmirx.dts,
+ * and PCIe, SATA and the FMC have no nodes.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/input/input.h>
+#include "xilinx/zynq-7000.dtsi"
+
+/ {
+	model = "RK-ZYNQ7100";
+	compatible = "rk,zynq-z7100", "xlnx,zynq-7000";
+
+	aliases {
+		ethernet0 = &gem0;
+		ethernet1 = &gem1;
+		serial0 = &uart0;
+		spi0 = &qspi;
+		mmc0 = &sdhci0;
+		mmc1 = &sdhci1;
+		usb0 = &usb0;
+	};
+
+	chosen {
+		bootargs = "earlycon";
+		stdout-path = "serial0:115200n8";
+	};
+
+	/* 2x MT41J256M16, 32-bit: 1 GiB. */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x40000000>;
+	};
+
+	/*
+	 * ULPI viewport of USB0, as zynq-zc702.dts does it. drv-vbus makes the
+	 * USB3320 assert CPEN, which turns on the TPS2051 feeding the USB-A
+	 * connector's VBUS (LED2 lights).
+	 */
+	usb_phy0: phy0@e0002000 {
+		compatible = "ulpi-phy";
+		#phy-cells = <0>;
+		reg = <0xe0002000 0x1000>;
+		view-port = <0x0170>;
+		drv-vbus;
+	};
+
+	/*
+	 * The XADC's die temperature and the PS/PL supply rails, in hwmon
+	 * where `sensors` and anything else looking for a temperature will
+	 * find them. The numbers are the index into the driver's channel
+	 * array (drivers/iio/adc/xilinx-xadc-core.c, xadc_7s_channels):
+	 * 0 temp, then vccint, vccaux, vccbram, vccpint, vccpaux, vccoddr.
+	 * vrefp/vrefn (7, 8) are the converter's own references and are left
+	 * out; they say nothing about the board.
+	 */
+	xadc-hwmon {
+		compatible = "iio-hwmon";
+		io-channels = <&adc 0>, <&adc 1>, <&adc 2>, <&adc 3>,
+			      <&adc 4>, <&adc 5>, <&adc 6>;
+	};
+
+	/*
+	 * The fan on J10. Its PWM comes from TTC1 channel 0 through EMIO and
+	 * the PL (fan_pwm in pl/board/rtl/fan_ctrl.v, which inverts it for the
+	 * board's NPN), so this node only does anything with a bitstream
+	 * loaded. Without one the fan is OFF, not free-running: PUDC_B is
+	 * strapped low, so the pull-ups hold W21 high and the transistor holds
+	 * the fan's PWM line down. Measured: about 8 C hotter that way.
+	 *
+	 * 40000 ns = 25 kHz, the speed-control frequency 4-wire fans expect.
+	 * cooling-levels are duty cycles out of 255 and become thermal cooling
+	 * states 0..4; software can also just write pwm1 under hwmon.
+	 */
+	fan: pwm-fan {
+		compatible = "pwm-fan";
+		pwms = <&ttc1 0 40000 0>;
+
+		/*
+		 * The tachometer, through EMIO GPIO 0 = Zynq GPIO 54, which
+		 * the PL drives from FAN_TACH. pwm-fan counts the edges and
+		 * publishes fan1_input in rpm.
+		 *
+		 * pulses-per-revolution is the FAN's property, not the
+		 * board's: 2 is what almost every 4-wire fan does and what
+		 * the one fitted here is assumed to do. If a different fan
+		 * goes on, the PL's FAN_STATUS register still counts raw
+		 * pulses per second and settles the question.
+		 */
+		interrupt-parent = <&gpio0>;
+		interrupts = <54 IRQ_TYPE_EDGE_FALLING>;
+		pulses-per-revolution = <2>;
+
+		/*
+		 * Cooling states 0..4. State 0 is deliberately NOT zero: a
+		 * zero duty stops the waveform, and the PL reads a stopped
+		 * waveform as "nobody is driving this" and forces full speed
+		 * (see fan_ctrl.v). A 25% floor keeps the waveform alive, so
+		 * the thermal governor's idle state is a quiet fan rather
+		 * than a loud one, and the tachometer keeps reading.
+		 */
+		cooling-levels = <64 102 153 204 255>;
+		#cooling-cells = <2>;
+	};
+
+	/*
+	 * A landing zone for the PL's BIST engines.
+	 *
+	 * The engines in pl/board/rtl/axi_bist.v are AXI masters on S_AXI_HP1 and
+	 * HP2. They write wherever their ADDR register points, with no bounds
+	 * check of any kind and at 64 bits a clock -- so they need somewhere that
+	 * is definitely not Linux's. This is the top 16 MB of the 1 GB of PS DRAM.
+	 *
+	 * ⚠ `no-map` is doing two jobs. It keeps the kernel out, and it keeps the
+	 * region out of the kernel's linear map, so /dev/mem hands it back
+	 * UNCACHED. That second part is not a detail: the HP ports are not
+	 * coherent with the CPU's caches, so a cached mapping would let the CPU
+	 * read stale lines and blame the memory. Nothing in the fabric can tell
+	 * those two apart.
+	 */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		bist_buf: bist-buffer@3f000000 {
+			reg = <0x3f000000 0x1000000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * LED1-4 and KEY1-4, as EMIO GPIOs, so they are an ordinary LED class
+	 * and an ordinary input device rather than bits in a register only
+	 * devmem can reach. Linux gpio numbers are 54 + the EMIO bit the PL
+	 * wires: 64..67 for the LEDs and 68..71 for the keys.
+	 *
+	 * The bicolor LED8 is deliberately NOT here. It stays driven by the
+	 * fabric (pl/board/rtl/axi4_regs.v) so the board still says whether the
+	 * PL is configured and clocked when no software is running at all.
+	 *
+	 * Like everything else on PL pins, these exist only once a bitstream
+	 * is loaded -- U-Boot does that before the kernel starts.
+	 */
+	leds {
+		compatible = "gpio-leds";
+
+		led-1 {
+			label = "rkz7100:green:led1";
+			gpios = <&gpio0 64 GPIO_ACTIVE_HIGH>;
+			/* Something visible that means "the kernel is alive".
+			 * `echo none > trigger` hands it back to you. */
+			linux,default-trigger = "heartbeat";
+		};
+
+		led-2 {
+			label = "rkz7100:green:led2";
+			gpios = <&gpio0 65 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-3 {
+			label = "rkz7100:green:led3";
+			gpios = <&gpio0 66 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-4 {
+			label = "rkz7100:green:led4";
+			gpios = <&gpio0 67 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+	};
+
+	/*
+	 * The four push buttons. They pull to ground against 4.7K pull-ups, so
+	 * active low; gpio-keys debounces in software, which is what these are
+	 * for -- they are mechanical and nothing here is time-critical.
+	 */
+	keys {
+		compatible = "gpio-keys";
+		autorepeat;
+
+		key-1 {
+			label = "KEY1";
+			linux,code = <KEY_1>;
+			gpios = <&gpio0 68 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+
+		key-2 {
+			label = "KEY2";
+			linux,code = <KEY_2>;
+			gpios = <&gpio0 69 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+
+		key-3 {
+			label = "KEY3";
+			linux,code = <KEY_3>;
+			gpios = <&gpio0 70 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+
+		key-4 {
+			label = "KEY4";
+			linux,code = <KEY_4>;
+			gpios = <&gpio0 71 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+	};
+
+	/*
+	 * The PL register file and the two BIST engines' interrupts.
+	 *
+	 * The registers themselves are reached through /dev/mem -- they are a
+	 * bring-up facility, not a device with a driver. What needs the kernel is
+	 * the INTERRUPT: IRQ_F2P[0], [1] and [5] are GIC 61, 62 and 66, which is
+	 * SPI 29, 30 and 34 here (the device tree numbers shared peripheral
+	 * interrupts from 32). Engines 0 and 1 sweep PS DRAM over the HP ports;
+	 * engine 2 sweeps the PL DDR3 through the MIG.
+	 *
+	 * uio_pdrv_genirq takes one interrupt per device, so there is one node per
+	 * engine, each mapping that engine's own 64-byte register window. Reading
+	 * 4 bytes from /dev/uioN blocks until the engine interrupts, which is what
+	 * turns "poll a status bit" into "wait for the hardware".
+	 *
+	 * ⚠ These exist only with a bitstream loaded. Without one the address
+	 * decodes to nothing and a read HANGS THE CPU -- U-Boot loads the
+	 * bitstream before the kernel starts for exactly this reason.
+	 */
+	pl_bist0: pl-bist@80100040 {
+		compatible = "generic-uio";
+		reg = <0x80100040 0x40>;
+		interrupt-parent = <&intc>;
+		interrupts = <0 29 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	pl_bist1: pl-bist@80100080 {
+		compatible = "generic-uio";
+		reg = <0x80100080 0x40>;
+		interrupt-parent = <&intc>;
+		interrupts = <0 30 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	pl_bist2: pl-bist@80100140 {
+		compatible = "generic-uio";
+		reg = <0x80100140 0x40>;
+		interrupt-parent = <&intc>;
+		interrupts = <0 34 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	/*
+	 * The board's I2C buses, bit-banged over EMIO GPIOs.
+	 *
+	 * Every one of them is on PL pins, so none of this works without a
+	 * bitstream that instantiates emio_pads.v -- see ../../pl/. The gpio
+	 * numbers are 54 + the EMIO bit the PL wired, and the PL fixes that
+	 * order: 55/56 HDMI TX, 57/58 HDMI RX, 59/60 camera, 61 ADV7611 reset.
+	 *
+	 * GPIO_OPEN_DRAIN is what makes these real I2C lines: gpiolib then
+	 * releases a line by turning the pin into an input rather than driving
+	 * it high, and the board's pull-ups do the rest. Without it two
+	 * devices driving opposite levels would be a short.
+	 *
+	 * delay-us = 5 is a half period, so about 100 kHz.
+	 */
+	i2c_hdmi_tx: i2c-hdmi-tx {
+		compatible = "i2c-gpio";
+		scl-gpios = <&gpio0 55 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		sda-gpios = <&gpio0 56 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <5>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+	i2c_hdmi_rx: i2c-hdmi-rx {
+		compatible = "i2c-gpio";
+		scl-gpios = <&gpio0 57 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		sda-gpios = <&gpio0 58 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <5>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+	/* Shared: the MIPI camera connector and the AT24C256 at 0x50. */
+	i2c_cam: i2c-cam {
+		compatible = "i2c-gpio";
+		scl-gpios = <&gpio0 59 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		sda-gpios = <&gpio0 60 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <5>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/*
+		 * Writable. R102 4.7K pulls WP to GROUND (schematic sheet 11),
+		 * and on this part WP is active high -- low means writes are
+		 * allowed. A byte written at offset 0x100 reads back.
+		 *
+		 * ⚠ The first 19 bytes hold the factory timestamp, the only
+		 * record on this board of when it was made. Do not write over
+		 * it casually; the MAC addresses follow at 0x20 and 0x26, and the rest is 0xFF.
+		 */
+		eeprom: eeprom@50 {
+			compatible = "atmel,24c256";
+			reg = <0x50>;
+			pagesize = <64>;
+
+			/*
+			 * ⚠ The cells live in a fixed-layout node, NOT as
+			 * direct children of the EEPROM. In this kernel at24 does
+			 * not set add_legacy_fixed_of_cells, so child-node cells
+			 * are never registered and every lookup of them fails.
+			 */
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/*
+				 * The PS Ethernet MAC, 6 raw bytes at 0x20 -- past
+				 * the factory timestamp and before the 0xFF. U-Boot
+				 * reads the same bytes in PREBOOT.
+				 */
+				eth0_mac: mac-address@20 {
+					reg = <0x20 6>;
+				};
+
+				/* The PL Ethernet port's: the next address up. */
+				eth1_mac: mac-address@26 {
+					reg = <0x26 6>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * The XADC's die temperature as a thermal sensor. No lookup table is
+	 * needed: the channel is IIO_TEMP, so thermal-generic-adc takes the
+	 * processed value as millicelsius, which is exactly what the driver's
+	 * scale and offset produce.
+	 */
+	xadc_thermal: xadc-thermal {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&adc 0>;
+		io-channel-names = "sensor-channel";
+	};
+
+	/*
+	 * Fan control with no daemon: the step_wise governor moves the fan
+	 * between the cooling states above as the die crosses these trips.
+	 *
+	 * The numbers come from what this board actually does (see
+	 * ../../doc/RK_ZYNQ7100_User_Guide.md section 9): 33-38 C with the fan
+	 * running and the high 40s with it stopped, both with the PL nearly
+	 * empty, so an idle board sits below the first trip and the fan stays
+	 * at its floor. A real design in the PL will sit higher, and the trips
+	 * are spaced to reach full speed well before anything is in danger.
+	 *
+	 * There is deliberately no "critical" trip. On this part it would mean
+	 * an orderly shutdown mid-experiment, and a bench board that turns
+	 * itself off is worse than a warm one; the fan reaching full speed at
+	 * 75 C is the last automatic step.
+	 */
+	thermal-zones {
+		die-thermal {
+			polling-delay = <5000>;
+			polling-delay-passive = <2000>;
+			thermal-sensors = <&xadc_thermal>;
+
+			trips {
+				die_warm: die-warm {
+					temperature = <45000>;
+					hysteresis = <4000>;
+					type = "active";
+				};
+				die_hot: die-hot {
+					temperature = <55000>;
+					hysteresis = <4000>;
+					type = "active";
+				};
+				die_hotter: die-hotter {
+					temperature = <65000>;
+					hysteresis = <4000>;
+					type = "active";
+				};
+				die_max: die-max {
+					temperature = <75000>;
+					hysteresis = <4000>;
+					type = "active";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&die_warm>;
+					cooling-device = <&fan 1 1>;
+				};
+				map1 {
+					trip = <&die_hot>;
+					cooling-device = <&fan 2 2>;
+				};
+				map2 {
+					trip = <&die_hotter>;
+					cooling-device = <&fan 3 3>;
+				};
+				map3 {
+					trip = <&die_max>;
+					cooling-device = <&fan 4 4>;
+				};
+			};
+		};
+	};
+};
+
+&clkc {
+	ps-clk-frequency = <33333333>;
+	fclk-enable = <0xf>;
+};
+
+/* FT2232HQ channel B, through a TXS0102: the console. */
+&uart0 {
+	status = "okay";
+};
+
+/*
+ * PS Ethernet. RTL8211F-CG strapped to address 1 (schematic: "PHY1 ADDR 001").
+ * The PHY's reset (PHYRSTB) is only pulled up -- there is no GPIO to declare.
+ * rgmii-id with CONFIG_REALTEK_PHY: the driver programs the RTL8211F's
+ * internal TX/RX delays.
+ */
+&gem0 {
+	status = "okay";
+	phy-mode = "rgmii-id";
+	phy-handle = <&ethernet_phy>;
+
+	/*
+	 * The MAC address. U-Boot's PREBOOT reads it from the EEPROM and fixes
+	 * it into this node as local-mac-address, and of_get_mac_address()
+	 * takes that FIRST -- mac-address, local-mac-address and address all
+	 * come before an nvmem cell. The cell below is the fallback for a boot
+	 * where U-Boot did not supply one, and it also makes gem0 wait for the
+	 * EEPROM to bind, which keeps it probing before GEM1 (see &gem1).
+	 *
+	 * ⚠ The EEPROM is on PL pins. The cell can be read only if something
+	 * configured the PL before gem0 probed -- U-Boot's PREBOOT does.
+	 */
+	nvmem-cells = <&eth0_mac>;
+	nvmem-cell-names = "mac-address";
+
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		ethernet_phy: ethernet-phy@1 {
+			reg = <1>;
+		};
+	};
+};
+
+/*
+ * The PL Ethernet port, RJ2. PHY2 (U19) is wired entirely to the PL, so its
+ * MAC is the PS's second controller, GEM1, brought out over EMIO as GMII and
+ * converted to RGMII by Xilinx's gmii_to_rgmii core in the PL bitstream. The
+ * core also carries GEM1's MDIO through to the PHY.
+ *
+ * phy-handle names the REAL PHY. The converter is a second device on the same
+ * bus, at address 8: xilinx_gmii2rgmii attaches to PHY2 and writes the
+ * negotiated speed into the core's register after every status read. Without
+ * it the core stays at its reset speed and only one link rate passes traffic.
+ *
+ * phy-mode is "gmii" -- GEM1 to the core is GMII -- and that also leaves
+ * PHY2's RGMII delays as strapped. The core's timing assumes the PHY delays
+ * both clocks internally, which is the RTL8211F's strapped default.
+ *
+ * ⚠ GEM1's clocks must come from EMIO. The boot's PS init does not route
+ * them there, because ENET1 is enabled only in the full design's PS
+ * configuration; board/S15fpga sets GEM1_RCLK_CTRL and GEM1_CLK_CTRL before
+ * networking starts. The kernel's clock driver will not switch that mux
+ * itself.
+ *
+ * ⚠ The MAC comes from the EEPROM, like eth0's, and that also fixes the
+ * NAMES. The EEPROM is on PL-pin I2C, so a controller that reads its MAC from
+ * it defers until at24 binds. With a MAC written into the device tree instead,
+ * GEM1 does not wait, probes first and takes eth0 -- and the boot's DHCP, which
+ * runs on eth0, moves to this port. With both reading the EEPROM, both defer,
+ * and they are retried in device-tree order: GEM0 is eth0, GEM1 is eth1.
+ */
+&gem1 {
+	status = "okay";
+	phy-mode = "gmii";
+	phy-handle = <&phy2>;
+	nvmem-cells = <&eth1_mac>;
+	nvmem-cell-names = "mac-address";
+
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* Strapped to address 001, the same as PHY1 -- different bus. */
+		phy2: ethernet-phy@1 {
+			reg = <1>;
+		};
+
+		gmii_to_rgmii: gmii-to-rgmii@8 {
+			compatible = "xlnx,gmii-to-rgmii-1.0";
+			reg = <8>;
+			phy-handle = <&phy2>;
+		};
+	};
+};
+
+/*
+ * microSD. A fixed TXS02612 translator sits between the 1.8 V MIO bank and
+ * the 3.3 V card, so no voltage switching; and the card-detect contact is not
+ * wired to the PS, so poll for insertion rather than miss a late card.
+ */
+&sdhci0 {
+	status = "okay";
+	bus-width = <4>;
+	disable-wp;
+	no-1-8-v;
+	broken-cd;
+};
+
+/* On-board eMMC, 4 data lines wired (MIO46-51). */
+&sdhci1 {
+	status = "okay";
+	bus-width = <4>;
+	non-removable;
+	disable-wp;
+	no-1-8-v;
+	cap-mmc-highspeed;
+};
+
+/*
+ * USB0: host mode on the USB-A connector. For the USB-C connector as a
+ * device (the configuration rk-zynq7100-fmcomms2-linux validated), boot
+ * zynq-rkz7100-usbdev.dtb instead.
+ */
+&usb0 {
+	status = "okay";
+	dr_mode = "host";
+	usb-phy = <&usb_phy0>;
+};
+
+/*
+ * Dual-parallel QSPI: two W25Q256FV, 32 MiB each, one on each chip select,
+ * read as one 64 MiB device. Same binding as zynq-zc706.dts in this kernel.
+ * The FMCOMMS2 port reports a harmless SPI-NOR "EAR" warning here; flashcp to
+ * /dev/mtd0 rewrites the boot partition from Linux.
+ */
+&qspi {
+	status = "okay";
+	num-cs = <2>;
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>, <1>;
+		parallel-memories = /bits/ 64 <0x2000000 0x2000000>;
+		spi-tx-bus-width = <1>;
+		spi-rx-bus-width = <4>;
+		spi-max-frequency = <50000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "boot";
+				reg = <0x0 0xe00000>;
+			};
+			partition@e00000 {
+				label = "u-boot-env";
+				reg = <0xe00000 0x80000>;
+			};
+			partition@e80000 {
+				label = "spare";
+				reg = <0xe80000 0x3180000>;
+			};
+		};
+	};
+};
+
+/*
+ * MIO7 is the USB3320's RESETB, through a diode, and also a boot strap with a
+ * 20K pull-down. The PS7 init leaves it a GPIO with TRI_ENABLE=1 in its SLCR
+ * pin register, which overrides the GPIO block's output enable -- so a hog
+ * alone "drives" a pin that is still floating (measured: DIRM/OEN/DATA bit 7
+ * all set, MIO_PIN_07 = 0x601, RESETB left on the divider near 1.3 V).
+ * bias-disable makes pinctrl-zynq clear TRI_ENABLE (and the pull-up); the hog
+ * then really holds the PHY out of reset. The reset PULSE the PHY needs after
+ * power-up is U-Boot's (CONFIG_PREBOOT in uboot-rkz7100.fragment).
+ */
+&pinctrl0 {
+	pinctrl_usb_phy_reset: usb-phy-reset {
+		mux {
+			groups = "gpio0_7_grp";
+			function = "gpio0";
+		};
+		conf {
+			pins = "MIO7";
+			bias-disable;
+			io-standard = <3>;	/* LVCMOS33: bank 500 */
+		};
+	};
+};
+
+&gpio0 {
+	status = "okay";
+	emio-gpio-width = <64>;
+
+	/*
+	 * Names for `gpioinfo`, so the header is self-describing from Linux:
+	 * a line reads J8.4-IO1_P rather than "line 72", where 4 is the
+	 * physical pin on J8. Offsets 0..53 are the MIO pins and are left
+	 * unnamed; 54..110 are the EMIO bits the PL wires out. Cosmetic only
+	 * -- naming a line neither claims it nor changes its direction.
+	 *
+	 * ⚠ These names describe what the BITSTREAM wires, not the silicon.
+	 * With no bitstream loaded, EMIO 18..51 reach no pin at all and the
+	 * J8 names are a promise nothing keeps.
+	 */
+	gpio-line-names =
+		"", "", "", "",	/* 0 */
+		"", "", "", "usb-phy-resetb",	/* 4 */
+		"", "", "", "",	/* 8 */
+		"", "", "", "",	/* 12 */
+		"", "", "", "",	/* 16 */
+		"", "", "", "",	/* 20 */
+		"", "", "", "",	/* 24 */
+		"", "", "", "",	/* 28 */
+		"", "", "", "",	/* 32 */
+		"", "", "", "",	/* 36 */
+		"", "", "", "",	/* 40 */
+		"", "", "", "",	/* 44 */
+		"", "", "", "",	/* 48 */
+		"", "", "fan-tach", "hdmi-tx-scl",	/* 52 */
+		"hdmi-tx-sda", "hdmi-rx-scl", "hdmi-rx-sda", "cam-scl",	/* 56 */
+		"cam-sda", "hdmi-rx-resetb", "cam-gpio", "cam-clk",	/* 60 */
+		"led1", "led2", "led3", "led4",	/* 64 */
+		"key1", "key2", "key3", "key4",	/* 68 */
+		"J8.4-IO1_P", "J8.3-IO1_N", "J8.6-IO2_P", "J8.5-IO2_N",	/* 72 */
+		"J8.8-IO3_P", "J8.7-IO3_N", "J8.10-IO4_P", "J8.9-IO4_N",	/* 76 */
+		"J8.12-IO5_P", "J8.11-IO5_N", "J8.14-IO6_P", "J8.13-IO6_N",	/* 80 */
+		"J8.16-IO7_P", "J8.15-IO7_N", "J8.18-IO8_P", "J8.17-IO8_N",	/* 84 */
+		"J8.20-IO9_P", "J8.19-IO9_N", "J8.22-IO10_P", "J8.21-IO10_N",	/* 88 */
+		"J8.24-IO11_P", "J8.23-IO11_N", "J8.26-IO12_P", "J8.25-IO12_N",	/* 92 */
+		"J8.28-IO13_P", "J8.27-IO13_N", "J8.30-IO14_P", "J8.29-IO14_N",	/* 96 */
+		"J8.32-IO15_P", "J8.31-IO15_N", "J8.34-IO16_P", "J8.33-IO16_N",	/* 100 */
+		"J8.36-IO17_P", "J8.35-IO17_N",	/* 104 */
+		/*
+		 * The SFP cages. TX_DISABLE is active HIGH and pulled up on the
+		 * board, so a module transmits only while Linux holds the line
+		 * low -- `gpioset gpiochip0 106=0` enables SFP1. Releasing it,
+		 * or anything crashing, turns the transmitter off again.
+		 */
+		"SFP1-TX_DISABLE", "SFP2-TX_DISABLE",	/* 106 */
+		"SFP1-LOS", "SFP2-LOS",	/* 108 */
+		"csi2rx-video-reset";	/* 110 */
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_usb_phy_reset>;
+
+	usb-phy-reset-hog {
+		gpio-hog;
+		gpios = <7 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb-phy-resetb";
+	};
+
+	/*
+	 * EMIO GPIO 7 (gpio 61): the ADV7611's RESET, active low, with a 4.7K
+	 * pull-down on the board. Until this is driven high the chip is held
+	 * in reset and does not answer on I2C at all. Unlike the USB PHY hog
+	 * above, this one reaches its pin only with a bitstream loaded.
+	 */
+	hdmi-rx-reset-hog {
+		gpio-hog;
+		gpios = <61 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "hdmi-rx-resetb";
+	};
+};
+
+/*
+ * XADC. #io-channel-cells lets the iio-hwmon node above consume its channels;
+ * the driver itself needs nothing beyond status.
+ */
+&adc {
+	status = "okay";
+	#io-channel-cells = <1>;
+};
+
+/*
+ * TTC1 as a PWM rather than a timer. #pwm-cells is what decides that: the
+ * clocksource driver refuses a TTC node that has it, and pwm-cadence refuses
+ * one that does not. TTC0 is left as it was -- the kernel registers it as
+ * ttc_clocksource (arm_global_timer is what actually gets used).
+ *
+ * Only channel 0 is wired out in the PL, to the fan. The cells are
+ * <channel period-ns flags>.
+ */
+&ttc1 {
+	#pwm-cells = <3>;
+};

@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Howard M. Harte
+//
+// Coverage scope for cov.sh: the benches and bus-functional models are not
+// instrumented. The primitive stubs are, and cov_summary.py leaves them out
+// of the report. The stored paths mix '/' and '\', so the globs match on
+// name fragments.
+`verilator_config
+coverage_off -file "*_tb.v"
+coverage_off -file "*_tb.sv"
+coverage_off -file "*axi_mem_bfm*"
+coverage_off -file "*gtx_sfp_model*"
+coverage_off -file "*verilated_std*"

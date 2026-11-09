@@ -1,0 +1,25 @@
+# Vivado writes these into the directory gen_ps7.tcl runs from.
+linux/NA/
+linux/.Xil/
+*.jou
+*.log
+
+# Build outputs, should a build ever be pointed inside the tree. The builds
+# write outside it by default: $RKZ7100_BUILD, or C:/rkz7100-build on
+# Windows and ~/rkz7100-build elsewhere.
+.Xil/
+*.bit
+*.bin
+*.dcp
+*.rpt
+*.str
+*.vvp
+*.vcd
+*.fst
+__pycache__/
+*.pyc
+release/
+
+# Locally generated boot initialization (source release contains the generator).
+ps7_init.tcl
+boot-init/

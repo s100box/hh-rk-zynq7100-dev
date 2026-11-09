@@ -1,0 +1,113 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Howard M. Harte
+#
+# Load the board's bitstream at boot, if one has been put there.
+#
+# This matters for more than the PL: the fan's PWM and tachometer are PL pins,
+# and PUDC_B is strapped low, so an unconfigured FPGA has its pull-ups holding
+# FAN_PWM high and the board's transistor holding the fan OFF. Until something
+# configures the PL, the part sits about 8 C hotter and the thermal zone has no
+# cooling device that reaches the fan. Loading early is the difference between
+# a board that cools itself and one that waits for a human.
+#
+# Deliberately not tied to any one design: whatever is at $BITSTREAM gets
+# loaded, and if nothing is there this exits quietly. Put the design you want
+# with `bit2bin.py <design>.bit /lib/firmware/rkz7100.bin` (see ../../pl/).
+
+BITSTREAM=/lib/firmware/rkz7100.bin
+FPGA=/sys/class/fpga_manager/fpga0
+
+# GEM1 -- the PL Ethernet port -- is clocked from EMIO: the gmii_to_rgmii core
+# in the bitstream supplies both its transmit and receive clocks. The boot's PS
+# init does not route them there, because ENET1 exists only in the full design's
+# PS configuration, and the kernel's clock driver will not switch that mux by
+# itself. So set the two SLCR registers here, before networking starts:
+#
+#   GEM1_RCLK_CTRL 0xF800013C  [4] SRCSEL = 1 (EMIO), [0] CLKACT
+#   GEM1_CLK_CTRL  0xF8000144  [6] SRCSEL = 1xx (EMIO), [0] CLKACT
+#
+# Only bits 6 and 0 are set in GEM1_CLK_CTRL. Its dividers belong to the clock
+# driver, which reprograms them on every link change; with the EMIO source
+# selected they are simply unused. The kernel unlocks the SLCR at boot and
+# leaves it so, and relocking it here would silently drop every later clock
+# driver write -- so it is unlocked, written, and left as found.
+#
+# Harmless with a bitstream that has no GEM1 wiring: GEM1 then has no clock,
+# which it did not have before either.
+gem1_clocks_from_emio() {
+	devmem 0xF8000008 32 0xDF0D
+	devmem 0xF800013C 32 0x11
+	v=$(( $(devmem 0xF8000144 32) | 0x41 ))
+	devmem 0xF8000144 32 "$(printf '0x%x' "$v")"
+}
+
+# When THIS script loaded the bitstream, GEM1 probed against an unconfigured
+# PL: its MDIO reaches PHY2 only through the gmii_to_rgmii core, so the PHY
+# scan at probe found nothing, and the gmii2rgmii converter never bound. Probe
+# it again now that the PL is up. (U-Boot normally loads the bitstream first,
+# and then none of this is needed.)
+reprobe_gem1() {
+	d=/sys/bus/platform/drivers/macb
+	[ -e "$d/e000c000.ethernet" ] || return 0
+	echo e000c000.ethernet > "$d/unbind" 2>/dev/null
+	echo e000c000.ethernet > "$d/bind" 2>/dev/null
+}
+
+# The same problem catches i2c CLIENTS, though not the buses themselves.
+# i2c-gpio registers an adapter without touching a pin, so the buses survive
+# being created early -- but a client that reads the part when it probes does
+# not. at24 validates the EEPROM at probe, gets nothing across dead pins, and
+# leaves the device unbound with no nvmem attribute, while a plain i2cget
+# works perfectly once the PL is up. Binding it again here is all it needs.
+#
+# Only at24 is rebound here. The kernel matches a device against the driver
+# before binding (bind_store -> driver_match_device), so writing every unbound
+# client's name to at24/bind binds only the EEPROM. The capture tree's ADV7611
+# and OV5647 are not re-probed; that tree needs U-Boot to have loaded the
+# bitstream.
+reprobe_i2c_clients() {
+	[ -d /sys/bus/i2c/drivers/at24 ] || return 0
+	for dev in /sys/bus/i2c/devices/*-*; do
+		case "${dev##*/}" in i2c-*) continue ;; esac
+		[ -e "$dev/driver" ] && continue
+		echo "${dev##*/}" > /sys/bus/i2c/drivers/at24/bind 2>/dev/null
+	done
+}
+
+start() {
+	[ -d "$FPGA" ] || { echo "S15fpga: no $FPGA -- is fpga-mgr-zynq built in?" >&2; exit 1; }
+
+	# U-Boot loads the bitstream from PREBOOT, and when it has, there is
+	# nothing to do here but route GEM1's clocks -- not even the re-probing
+	# below. Every bus on PL pins existed before the kernel started, so the
+	# drivers found their devices the first time and gem1 could read its MAC
+	# from the EEPROM. Reloading would only tear all of that down again.
+	if [ "$(cat "$FPGA/state" 2>/dev/null)" = "operating" ]; then
+		echo "PL already configured by U-Boot"
+		gem1_clocks_from_emio
+		exit 0
+	fi
+
+	[ -f "$BITSTREAM" ] || exit 0
+
+	printf 'Loading %s into the PL: ' "$(basename "$BITSTREAM")"
+	# 0 = full reconfiguration. The name is relative to /lib/firmware.
+	echo 0 > "$FPGA/flags"
+	if ! echo "$(basename "$BITSTREAM")" > "$FPGA/firmware" 2>/dev/null; then
+		echo "FAILED (see dmesg; a .bin that is not byte-swapped is the usual cause)"
+		exit 1
+	fi
+	echo "$(cat "$FPGA/state")"
+
+	gem1_clocks_from_emio
+	reprobe_gem1
+	reprobe_i2c_clients
+}
+
+case "$1" in
+	start) start ;;
+	stop) ;;
+	restart|reload) start ;;
+	*) echo "usage: $0 {start|stop|restart}" >&2; exit 1 ;;
+esac

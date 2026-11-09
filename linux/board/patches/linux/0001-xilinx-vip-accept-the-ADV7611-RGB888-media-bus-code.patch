@@ -1,0 +1,38 @@
+xilinx-vip: accept the ADV7611 RGB888 media bus code
+
+The HDMI input on the RK-ZYNQ7100 is an ADV7611, driven by the mainline
+adv7604 driver, and its 24-bit RGB source pad reports
+MEDIA_BUS_FMT_RGB888_1X24. The Xilinx VIP format table only knows
+MEDIA_BUS_FMT_RBG888_1X24, so with the two joined by xilinx-vipp:
+
+  xvip_get_format_by_code(RGB888_1X24)  -> -EINVAL
+  VIDIOC_ENUM_FMT / VIDIOC_G_FMT        -> -EINVAL
+  VIDIOC_STREAMON                       -> -EINVAL
+
+xvip_dma_verify_format() compares dma->fmtinfo->code, which comes from
+xvip_get_format_by_fourcc(), against the code the subdev reports, so the
+new entry has to come BEFORE the existing RBG888/BGR24 one: both scans
+return their first match, and only this order makes the two agree.
+
+The byte order is not a coincidence. The ADV7611 in SDR 4:4:4 8-bit with
+OP_CH_SEL = RGB drives P23-P16 = R, P15-P8 = G, P7-P0 = B, which the
+capture block passes straight through, and the VDMA writes TDATA[7:0]
+to the first byte in memory. So memory reads B, G, R -- which is what
+V4L2_PIX_FMT_BGR24 means.
+
+Nothing that was resolvable before resolves differently: the RBG888
+entries are untouched, and by_fourcc(RGB24) still finds the RBG one.
+
+Signed-off-by: Howard M. Harte <hharte@magicandroidapps.com>
+
+--- a/drivers/media/platform/xilinx/xilinx-vip.c
++++ b/drivers/media/platform/xilinx/xilinx-vip.c
+@@ -80,6 +80,8 @@
+ 	  2, 24, V4L2_PIX_FMT_X416, 1, 1, 1, 1 },
+ 	{ XVIP_VF_YUV_444, 16, NULL, MEDIA_BUS_FMT_VUY16_1X48,
+ 	  2, 24, V4L2_PIX_FMT_X416M, 1, 1, 1, 1 },
++	{ XVIP_VF_RBG, 8, NULL, MEDIA_BUS_FMT_RGB888_1X24,
++	  3, 24, V4L2_PIX_FMT_BGR24, 1, 1, 1, 1 },
+ 	{ XVIP_VF_RBG, 8, NULL, MEDIA_BUS_FMT_RBG888_1X24,
+ 	  3, 24, V4L2_PIX_FMT_BGR24, 1, 1, 1, 1 },
+ 	{ XVIP_VF_RBG, 8, NULL, MEDIA_BUS_FMT_RBG888_1X24,

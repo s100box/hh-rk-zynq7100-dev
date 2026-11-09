@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Howard M. Harte
+#
+# Pre-commit: the checks that are cheap enough to run on every commit, and the
+# RTL gate when the commit touches RTL, all on the staged tree. Synthesis
+# stays out of it.
+#
+#   1. every shell script parses (sh -n), the board's init script included
+#   2. every Python script compiles
+#   3. the J8 pin blocks in both XDC files match gen_j8_xdc.py
+#   4. PS7 generation/cache and Linux/TFTP staging host regressions
+#   5. if anything under pl/*/rtl or pl/sim is staged: pl/sim/run.sh -- every
+#      bench, and the elaboration and Verilator lint of both top levels
+#      (a few minutes)
+#
+# Enable once per clone:    git config core.hooksPath .githooks
+# Bypass for a work-in-progress commit:   git commit --no-verify
+
+set -e
+# Resolve shared tools before deciding whether RTL checks can run.
+_build="${RETROSIM_BUILD:-$(git rev-parse --show-toplevel)/../retrosim-build}"
+if [ -f "$_build/hooks/gate-env.sh" ]; then
+    _build=$(cd "$_build" && pwd)
+    . "$_build/hooks/gate-env.sh"
+fi
+# The staged export has no sibling checkout; retain the resolved shared path.
+export RETROSIM_BUILD="$_build"
+unset _build
+top=$(git rev-parse --show-toplevel)
+cd "$top"
+
+# ⚠ Every check runs on what is STAGED, not on the working tree: the index is
+# exported to a scratch directory and checked there. Checked in place, a
+# commit that leaves out a file the checks read -- a new bench list, a changed
+# include -- would pass here and fail in every fresh clone.
+sh_files=$(git ls-files '*.sh')
+py_files=$(git ls-files '*.py')
+rtl_staged=$(git diff --cached --name-only | grep -E '^pl/(board|ddr)/rtl/|^pl/sim/' || true)
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+git checkout-index -a --prefix="$stage/"
+cd "$stage"
+
+echo "[pre-commit] shell scripts parse"
+for f in $sh_files linux/board/S15fpga .githooks/pre-commit; do
+    sh -n "$f" || { echo "  $f does not parse"; exit 1; }
+done
+
+echo "[pre-commit] Python compiles"
+py=${PYTHON3:-$(command -v python3 || command -v python || true)}
+if [ -n "$py" ]; then
+    for f in $py_files; do
+        "$py" -c "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read(), sys.argv[1])" "$f" ||
+            { echo "  $f does not compile"; exit 1; }
+    done
+    echo "[pre-commit] J8 pin blocks are current"
+    "$py" pl/tools/gen_j8_xdc.py --check
+    echo "[pre-commit] PS7 generation and Linux staging host tests"
+    "$py" -m unittest discover -s linux/tests
+else
+    echo "  (no python -- skipping the Python checks)"
+fi
+
+if [ -n "$rtl_staged" ]; then
+    echo "[pre-commit] RTL staged: pl/sim/run.sh"
+    if command -v iverilog >/dev/null 2>&1; then
+        sh pl/sim/run.sh > "${TMPDIR:-/tmp}/rkz7100-precommit.log" 2>&1 || {
+            tail -30 "${TMPDIR:-/tmp}/rkz7100-precommit.log"
+            echo "  pl/sim/run.sh failed; full log in ${TMPDIR:-/tmp}/rkz7100-precommit.log"
+            exit 1
+        }
+        tail -1 "${TMPDIR:-/tmp}/rkz7100-precommit.log"
+    else
+        echo "  (no iverilog on PATH -- the RTL gate was NOT run)"
+    fi
+fi
+
+echo "[pre-commit] all checks passed"

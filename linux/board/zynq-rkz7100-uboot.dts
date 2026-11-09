@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: GPL-2.0+
+// SPDX-FileCopyrightText: 2026 Howard M. Harte
+/*
+ * RK-ZYNQ7100 device tree for U-Boot (SPL and U-Boot proper).
+ *
+ * Leaner than the kernel's: console, boot media and network. DDR, MIO and PLL
+ * bring-up do not come from here -- SPL runs ps7_init_gpl.c before this tree is
+ * parsed (see uboot-rkz7100.fragment).
+ *
+ * ⚠ bootph-all only where U-Boot PROPER needs the node before relocation too:
+ * the clock controller and the console. U-Boot proper's pre-relocation heap
+ * and stack share 8 KiB of OCM (CFG_SYS_INIT_RAM_SIZE = 0x2000), and every
+ * node bound early costs heap. With bootph-all on QSPI, the flash, SD and the
+ * GPIO hog as well, the UART's clk_get_by_index() hit -ENOMEM and U-Boot
+ * panicked -- and panic() resets the chip, so the only symptom was silence.
+ * Raising SYS_MALLOC_F_LEN to 64 KiB instead overran the 8 KiB and data-aborted.
+ * The boot media are SPL-only (bootph-pre-ram): SPL needs them to load
+ * u-boot.img, and U-Boot proper binds them after relocation like everything
+ * else.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include "zynq-7000.dtsi"
+
+/ {
+	model = "RK-ZYNQ7100";
+	compatible = "rk,zynq-z7100", "xlnx,zynq-7000";
+
+	aliases {
+		ethernet0 = &gem0;
+		serial0 = &uart0;
+		spi0 = &qspi;
+		mmc0 = &sdhci0;
+		mmc1 = &sdhci1;
+		usb0 = &usb0;
+	};
+
+	chosen {
+		bootargs = "";
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x40000000>;
+	};
+};
+
+&clkc {
+	ps-clk-frequency = <33333333>;
+	bootph-all;
+};
+
+&uart0 {
+	status = "okay";
+	bootph-all;
+};
+
+&sdhci0 {
+	status = "okay";
+	bus-width = <4>;
+	disable-wp;
+	no-1-8-v;
+	bootph-pre-ram;
+};
+
+&sdhci1 {
+	status = "okay";
+	bus-width = <4>;
+	non-removable;
+	disable-wp;
+	no-1-8-v;
+};
+
+/* Dual-parallel 2x W25Q256FV, as zynq-zc706.dts in this U-Boot. */
+&qspi {
+	status = "okay";
+	num-cs = <2>;
+	bootph-pre-ram;
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>, <1>;
+		parallel-memories = /bits/ 64 <0x2000000 0x2000000>;
+		spi-tx-bus-width = <1>;
+		spi-rx-bus-width = <4>;
+		spi-max-frequency = <50000000>;
+		bootph-pre-ram;
+	};
+};
+
+&gem0 {
+	status = "okay";
+	phy-mode = "rgmii-id";
+	phy-handle = <&ethernet_phy>;
+
+	/*
+	 * The MAC address comes out of the EEPROM below. U-Boot's eth-uclass
+	 * reads an nvmem cell named "mac-address" exactly as Linux does, so
+	 * one description serves both and neither has to be told separately.
+	 *
+	 * The EEPROM is on PL pins, and gem0 probes during "Net:", before
+	 * PREBOOT loads the bitstream, so on a normal boot this read finds no
+	 * EEPROM and gem0 starts with a random address. PREBOOT then reads the
+	 * same six bytes over I2C and forces ethaddr (uboot-rkz7100.fragment).
+	 */
+	nvmem-cells = <&eth0_mac>;
+	nvmem-cell-names = "mac-address";
+
+	ethernet_phy: ethernet-phy@1 {
+		reg = <1>;
+	};
+};
+
+/ {
+	/*
+	 * The camera/EEPROM I2C bus, bit-banged over EMIO GPIO 59 (SCL) and 60
+	 * (SDA) -- Zynq numbering, so 54 + the EMIO bit the PL wires.
+	 *
+	 * Deliberately not bootph-*: U-Boot proper binds this after
+	 * relocation, where there is heap to spare. See the warning at the top
+	 * of this file about what early binding costs.
+	 */
+	i2c_cam: i2c-cam {
+		compatible = "i2c-gpio";
+		scl-gpios = <&gpio0 59 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		sda-gpios = <&gpio0 60 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <5>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		eeprom: eeprom@50 {
+			compatible = "atmel,24c256";
+			reg = <0x50>;
+			pagesize = <64>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/* 6 raw bytes at 0x20, past the factory timestamp. */
+			eth0_mac: mac-address@20 {
+				reg = <0x20 6>;
+			};
+		};
+	};
+};

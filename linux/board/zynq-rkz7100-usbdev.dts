@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-2.0
+// SPDX-FileCopyrightText: 2026 Howard M. Harte
+/*
+ * RK-ZYNQ7100 with USB0 as a DEVICE on the USB-C connector (USB2), instead of
+ * a host on USB-A. This is the USB configuration rk-zynq7100-fmcomms2-linux
+ * validated on the board (RNDIS/ACM gadgets through the USB3320). Everything
+ * else is zynq-rkz7100.dts.
+ *
+ * The two connectors share one PHY and one D+/D- pair: use one at a time.
+ */
+
+#include "zynq-rkz7100.dts"
+
+/ {
+	model = "RK-ZYNQ7100 (USB device)";
+};
+
+&usb_phy0 {
+	/delete-property/ drv-vbus;
+};
+
+&usb0 {
+	dr_mode = "peripheral";
+	maximum-speed = "high-speed";
+};

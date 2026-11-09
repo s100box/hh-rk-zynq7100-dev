@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: GPL-2.0
+// SPDX-FileCopyrightText: 2026 Howard M. Harte
+/*
+ * RK-ZYNQ7100 with the HDMI input and the camera as V4L2 capture devices.
+ *
+ * The ADV7611 (U23) hands the fabric 24-bit RGB with its own clock; the PL
+ * turns that into AXI4-Stream video (pl/board/rtl/hdmi_rx_capture.v) and an
+ * AXI VDMA writes it into PS DRAM through S_AXI_HP0. The camera's OV5647
+ * sends RAW10 Bayer over two MIPI lanes to a CSI-2 receiver in the PL, and a
+ * second VDMA writes that through S_AXI_HP3:
+ *
+ *   HDMI2 -> ADV7611 -> hdmi_rx_capture -> AXI VDMA -> S_AXI_HP0 -> DRAM
+ *              |                              |
+ *        adv7604 (i2c-gpio)        xilinx_dma, xilinx-vipp -> /dev/video0
+ *
+ *   J9 -> OV5647 -> CSI-2 RX -> AXI VDMA -> S_AXI_HP3 -> DRAM
+ *           |          |           |
+ *        ov5647   xilinx-csi2rxss  xilinx_dma, xilinx-vipp -> /dev/video1
+ *
+ * Both VDMAs and the receiver sit behind one crossbar on M_AXI_GP1, 64 KB
+ * apart. Everything else is zynq-rkz7100.dts.
+ *
+ * ⚠ WHY THIS IS A SEPARATE DEVICE TREE AND NOT PART OF THE MAIN ONE.
+ *
+ * The VDMA node has a `reg`, and probing it reads a PL address. With a
+ * bitstream that has no VDMA at it, that read is an AXI transaction nothing
+ * will ever answer and THE CPU HANGS THERE -- no oops, no console, no ping,
+ * and the reboot you type next goes nowhere. Keeping these nodes out of the
+ * default tree means the board still boots with any other bitstream loaded.
+ *
+ * Boot this tree only with the bitstream that contains the capture path.
+ */
+
+#include "zynq-rkz7100.dts"
+
+/ {
+	model = "RK-ZYNQ7100 (HDMI capture)";
+
+	/*
+	 * AXI VDMA, S2MM only. Its AXI-Lite slave sits in the M_AXI_GP1
+	 * window; its data master goes to S_AXI_HP0.
+	 *
+	 * xlnx,datawidth = 24 because the stream is one RGB888 pixel per
+	 * beat. The driver turns that into 3 bytes per pixel, and every CEA
+	 * width is a multiple of 8 pixels, so a line is always a whole number
+	 * of 64-bit AXI beats and the memory side never needs realignment.
+	 *
+	 * Every clock here is FCLK_CLK0. The ADV7611's LLC never reaches the
+	 * VDMA: hdmi_rx_capture crosses the pixels into the AXI domain
+	 * (axis_cdc_fifo) before they arrive. `clocks` still has to name
+	 * something for each entry, and the driver only enables them.
+	 */
+	vdma_hdmirx: dma@80000000 {
+		compatible = "xlnx,axi-vdma-1.00.a";
+		#dma-cells = <1>;
+		reg = <0x80000000 0x10000>;
+		xlnx,addrwidth = <32>;
+		xlnx,num-fstores = <3>;
+		xlnx,flush-fsync = <1>;
+		clocks = <&clkc 15>, <&clkc 15>, <&clkc 15>;
+		clock-names = "s_axi_lite_aclk", "m_axi_s2mm_aclk",
+			      "s_axis_s2mm_aclk";
+
+		dma-channel@80000030 {
+			compatible = "xlnx,axi-vdma-s2mm-channel";
+			interrupt-parent = <&intc>;
+			interrupts = <0 31 IRQ_TYPE_LEVEL_HIGH>;
+			xlnx,datawidth = <24>;
+		};
+	};
+
+	/*
+	 * The V4L2 pipeline. xilinx-vipp walks this graph, binds whatever
+	 * subdev the endpoint points at -- here the ADV7611, through the
+	 * ordinary async notifier -- and creates /dev/video0 on the DMA.
+	 */
+	/*
+	 * ⚠ The channel is 1, not 0, even though this VDMA has exactly one.
+	 *
+	 * xilinx_dma numbers MM2S channels from 0 and S2MM channels from
+	 * max_channels / 2, which is 1 for a VDMA -- whether or not an MM2S
+	 * channel was built. Asking for 0 gets "no VDMA channel found", then
+	 * "DMA initialization failed", and no /dev/video0, with the VDMA
+	 * driver itself having probed perfectly happily just above.
+	 */
+	video_cap: video-capture {
+		compatible = "xlnx,video";
+		dmas = <&vdma_hdmirx 1>;
+		dma-names = "port0";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				direction = "input";
+
+				vcap_in: endpoint {
+					remote-endpoint = <&adv7611_out>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * The camera VDMA: the HDMI one's twin with a 16-bit stream, one
+	 * RAW10 pixel per beat in the low ten bits, so two bytes per pixel in
+	 * memory. Its stream runs on FCLK_CLK0 like every other side of it.
+	 */
+	vdma_cam: dma@80010000 {
+		compatible = "xlnx,axi-vdma-1.00.a";
+		#dma-cells = <1>;
+		reg = <0x80010000 0x10000>;
+		xlnx,addrwidth = <32>;
+		xlnx,num-fstores = <3>;
+		xlnx,flush-fsync = <1>;
+		clocks = <&clkc 15>, <&clkc 15>, <&clkc 15>;
+		clock-names = "s_axi_lite_aclk", "m_axi_s2mm_aclk",
+			      "s_axis_s2mm_aclk";
+
+		dma-channel@80010030 {
+			compatible = "xlnx,axi-vdma-s2mm-channel";
+			interrupt-parent = <&intc>;
+			interrupts = <0 32 IRQ_TYPE_LEVEL_HIGH>;
+			xlnx,datawidth = <16>;
+		};
+	};
+
+	/*
+	 * The CSI-2 receiver. csi-pxl-format 0x2b is RAW10; the video frame
+	 * buffer is built in, and the driver refuses to run without one.
+	 *
+	 * video-reset-gpios is gpio 110 (EMIO bit 56), synchronized in the PL. The
+	 * driver pulses it at probe and after every stream stop; it is how the
+	 * driver recovers the core after a stream error. A clean restart does
+	 * not need it: that depends on clock-noncontinuous on the sensor's
+	 * endpoint, below.
+	 */
+	csi2rx: csi2rx@80020000 {
+		compatible = "xlnx,mipi-csi2-rx-subsystem-5.0";
+		reg = <0x80020000 0x20000>;
+		interrupt-parent = <&intc>;
+		interrupts = <0 33 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkc 15>, <&clkc 15>;
+		clock-names = "lite_aclk", "video_aclk";
+		video-reset-gpios = <&gpio0 110 GPIO_ACTIVE_HIGH>;
+		xlnx,csi-pxl-format = <0x2b>;
+		xlnx,vfb;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* from the sensor */
+			port@0 {
+				reg = <0>;
+
+				csi2rx_in: endpoint {
+					data-lanes = <1 2>;
+					remote-endpoint = <&ov5647_out>;
+				};
+			};
+
+			/* to the VDMA */
+			port@1 {
+				reg = <1>;
+
+				csi2rx_out: endpoint {
+					remote-endpoint = <&vcam_in>;
+				};
+			};
+		};
+	};
+
+	/* Channel 1, not 0, for the same reason as video_cap's. */
+	video_cam: video-camera {
+		compatible = "xlnx,video";
+		dmas = <&vdma_cam 1>;
+		dma-names = "port0";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				direction = "input";
+
+				vcam_in: endpoint {
+					remote-endpoint = <&csi2rx_out>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * The OV5647's clock. The module carries its own 25 MHz oscillator --
+	 * the sensor answers on I2C with nothing driving J9's CAM_CLK -- and
+	 * the driver refuses any other rate, so this only tells it so.
+	 */
+	cam_xclk: cam-xclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <25000000>;
+	};
+};
+
+/*
+ * The sensor, on the camera connector's bit-banged bus beside the EEPROM.
+ *
+ * pwdn-gpios is J9 pin 5, the Raspberry Pi connector's CAM_IO0: the module's
+ * enable, high = on, which the module also pulls up itself. Naming it lets
+ * the driver power the sensor down between streams.
+ *
+ * ⚠ clock-noncontinuous is what makes a SECOND stream work. With a
+ * continuous clock lane only the first stream after the bitstream loads
+ * delivers frames; every later one runs with the byte clock present and no
+ * packet received, and neither the receiver's video reset nor a full fabric
+ * reset brings it back. Measured the same with the sensor powered off
+ * between streams and with it held on. With the lane going to LP-11 between
+ * lines, every stream restarts cleanly.
+ */
+&i2c_cam {
+	ov5647: camera@36 {
+		compatible = "ovti,ov5647";
+		reg = <0x36>;
+		clocks = <&cam_xclk>;
+		pwdn-gpios = <&gpio0 62 GPIO_ACTIVE_LOW>;
+
+		port {
+			ov5647_out: endpoint {
+				remote-endpoint = <&csi2rx_in>;
+				data-lanes = <1 2>;
+				clock-noncontinuous;
+			};
+		};
+	};
+};
+
+/*
+ * The receiver itself, on the bit-banged bus the PL already provides.
+ *
+ * ⚠ The address is 0x4C because the ADV7611 samples its VS/FIELD/ALSB pin
+ * out of reset to choose between 0x4C and 0x4D, and that pin is wired to the
+ * PL. The fabric must leave it an input; see pl/board/xdc/rkz7100_pl.xdc.
+ *
+ * ⚠ No reset-gpios here. The reset pin is gpio 61 (EMIO bit 7) and a gpio-hog in the
+ * base tree already holds the chip out of reset -- that hog is what makes the
+ * chip answer on I2C at all. Claiming the line here as well would fail to
+ * probe. The driver does a software reset instead.
+ *
+ * ⚠ No hpd-gpios either: HPA_A on the ADV7611 drives the connector's
+ * hot-plug line directly, so hot-plug needs nothing from software.
+ *
+ * Only the EDID page is relocated, to 0x66. Every other map keeps its
+ * default address.
+ */
+&i2c_hdmi_rx {
+	adv7611: hdmi-receiver@4c {
+		compatible = "adi,adv7611";
+		reg = <0x4c>, <0x66>;
+		reg-names = "main", "edid";
+		default-input = <0>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* HDMI in, from connector HDMI2 */
+			port@0 {
+				reg = <0>;
+			};
+
+			/* 24-bit parallel video out, into the PL */
+			port@1 {
+				reg = <1>;
+
+				adv7611_out: endpoint {
+					remote-endpoint = <&vcap_in>;
+				};
+			};
+		};
+	};
+};

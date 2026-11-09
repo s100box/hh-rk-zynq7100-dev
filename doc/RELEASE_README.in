@@ -1,0 +1,130 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0
+     SPDX-FileCopyrightText: 2026 Howard M. Harte
+     package.sh fills in @VERSION@ and @COMMIT@. -->
+# RK-ZYNQ7100 release @VERSION@
+
+Board images and the corresponding source snapshot. Rebuilding also needs
+the tools and sibling checkout listed below. Built from commit `@COMMIT@`.
+
+The board is an AMD Zynq-7000 `xc7z100ffg900-2` with 1 GB of PS DDR3, 1 GB of
+PL DDR3, HDMI in and out, a MIPI camera connector, two SFP+ cages, two
+Gigabit Ethernet ports, a 40-pin header, eMMC, QSPI and micro-SD.
+
+## What is here
+
+| | |
+|---|---|
+| `bitstreams/rkz7100-board.bit`, `.bin` | The whole board in one design: the PL DDR3, the register file, HDMI in and out, the camera, the SFP transceivers, PL Ethernet, the 40-pin header, the fan and three memory test engines |
+| `bitstreams/rkz7100-ddr.bit`, `.bin` | The PL DDR3 and its test engines alone -- the minimal design for bringing a MIG up (present when the release was built with `--ddr`) |
+| `bitstreams/board-timing.txt`, `board-utilization.txt` | Vivado's timing and utilization reports for the board bitstream |
+| `linux/` | U-Boot, the kernel, three device trees and a root filesystem (`rootfs.ext4.gz`), plus `sdcard.img.gz` |
+| `source/` | The repository this was built from, exactly as committed |
+| `SHA256SUMS` | A checksum for every file above |
+
+`.bit` is for JTAG and Vivado; `.bin` is the byte order Linux's
+`fpga_manager` takes. `source/pl/bit2bin.py` converts one to the other.
+
+## Running it without building anything
+
+**From an SD card.** Write `linux/sdcard.img.gz` to a card -- `zcat
+linux/sdcard.img.gz | sudo dd of=/dev/sdX bs=4M conv=fsync`, or balenaEtcher,
+which takes the `.gz` as it is -- set SW1 to SD (both switches off) and power
+up. The console is the second of the two serial ports the JTAG USB-C port (USB1)
+adds, 115200 8N1. It
+boots to a login prompt; the user is `root` with no password. ⚠ The card image
+is checked by the packager but has not yet been booted on the board itself;
+the flash and network boots below have.
+
+The card carries the board bitstream, `rkz7100.bin` on its FAT partition, and
+U-Boot loads it before the kernel starts, so the PL is configured before Linux
+probes the devices that live on it. To run a different design, replace that
+file; the `.bin` files in `bitstreams/` are already in the form it takes.
+
+**From the board's own flash.** See "Installing to eMMC and QSPI" in
+`source/linux/README.md`. The board then boots with nothing attached. There,
+the bitstream U-Boot loads is `/boot/rkz7100.bin` on the eMMC; put one there
+from `bitstreams/`.
+
+⚠ **Do not read a PL address before a bitstream is loaded.** The access is
+answered by nothing and the CPU stops there -- no message, no recovery but a
+reset.
+
+## Checking the hardware
+
+`source/pl/tools/` and `source/pl/ddr/test-ddr.sh` hold a script for each part
+of the board. They print what they measured, not just a verdict:
+
+```
+sh bisttest.sh          # the memory test engines, and their interrupts
+sh ../ddr/test-ddr.sh -b 0x80100000   # the PL DDR3 (memtest too, if built beside it)
+sh hdmitest.sh          # HDMI out: the transmitter's PLL and its setup
+sh hdmirxtest.sh -c     # HDMI in: capture frames and check the pattern
+sh camtest.sh           # the camera, in every sensor mode
+sh gtxtest.sh -r all    # the SFP+ transceivers at all three line rates
+sh eth2test.sh          # the PL Ethernet port at 1000, 100 and 10 Mb/s
+sh j8test.sh            # all 34 pins of the 40-pin header
+```
+
+The HDMI tests need a cable from HDMI1 to HDMI2, the SFP test a cable between
+the two cages, and the camera test a module in J9.
+
+## Rebuilding
+
+Clone `retrosim-build` beside `source/` before rebuilding or running the
+simulation gate, and install Python 3.10 or later. Follow the shared tool
+setup linked from `source/README.md`; the sibling is not bundled here.
+
+**The PL** needs AMD Vivado 2026.1, because the IP versions are fixed:
+
+```
+vivado -mode batch -source source/pl/board/build.tcl -tclargs <build dir>
+```
+
+For the GUI, add `project` and open the `.xpr` it names:
+
+```
+vivado -mode batch -source source/pl/board/build.tcl -tclargs <build dir> project
+```
+
+Both read the same file lists, so the project and the batch build cannot
+disagree.
+
+**The simulation gate** additionally needs Icarus Verilog; Verilator enables
+optional lint, and Yosys enables the block-RAM check. It is the thing to run before a Vivado build:
+
+```
+sh source/pl/sim/run.sh
+```
+
+**Linux** is built by Buildroot; see `source/linux/README.md`.
+
+## Licensing
+
+Original hardware designs, scripts and documents use MIT OR Apache-2.0, at
+your option. `source/README.md` lists exceptions, including GPL device trees,
+kernel patches and generated PS initialization files, plus vendor-derived
+board data. Review that license section and each file's notice before
+redistributing. Generated `ps7_init.tcl` is excluded from this source snapshot
+and the release artifacts. The PL build generates it locally for JTAG boot;
+`source/doc/linux-guide.md` describes standalone generation as well.
+`source/LICENSE-MIT` and `source/LICENSE-APACHE` contain the license texts.
+
+The binaries in `linux/` are a different matter. The kernel, U-Boot and
+BusyBox are GPL-licensed, and their sources are published beside this
+release as `rkz7100-@VERSION@-gpl-sources.tar.gz` -- every upstream tarball
+Buildroot used, with its manifest. `linux/gpl-manifest.csv` lists what is in
+it: package, version, license and where it came from. If that archive is not
+beside this one, the binaries should not be redistributed.
+
+The bitstreams contain AMD/Xilinx IP, which its license allows to be used on
+Xilinx devices.
+
+## Where the detail is
+
+| | |
+|---|---|
+| `source/README.md` | what the board is and what has been measured on it |
+| `source/doc/RK_ZYNQ7100_User_Guide.md` | the board itself: power, clocks, banks, every peripheral with pin tables, and the known issues |
+| `source/pl/README.md` | the PL designs: address map, registers, and every block with its measurements |
+| `source/linux/README.md` | the Linux port, booting, and installing to flash |
+| `source/pl/sim/README.md` | the benches, and what each is built to catch |

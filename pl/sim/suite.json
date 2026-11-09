@@ -1,0 +1,28 @@
+{
+  "root": "../..",
+  "manifests": "benches/*.f",
+  "standard": "-g2005",
+  "compile_flags": [
+    "-Wall"
+  ],
+  "run_flags": [],
+  "timeout": 900,
+  "max_jobs": 4,
+  "pass_pattern": "{name}: PASS",
+  "coverage_inputs": [
+    "coverage.vlt"
+  ],
+  "coverage_flags": [
+    "-Wno-fatal",
+    "-Wno-lint",
+    "-Wno-style",
+    "-Wno-MULTIDRIVEN",
+    "--x-assign",
+    "0",
+    "--x-initial",
+    "0",
+    "--output-split-cfuncs",
+    "0"
+  ],
+  "coverage_summary": "cov_summary.py"
+}

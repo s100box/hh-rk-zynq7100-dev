@@ -1,0 +1,163 @@
+adv7604: poll the status registers when no interrupt is wired
+
+The RK-ZYNQ7100 does not connect the ADV7611's interrupt. INT1 (pin 55)
+is a bare stub on the schematic, and so are the alternate SCLK/INT2 (49)
+and MCLK/INT2 (51); pin 1 is wired but used for its HPA function. There
+is therefore nothing to declare in the device tree and client->irq is 0.
+
+For video that is survivable, because userspace re-reads the timings. For
+CEC it is fatal, and in a way that looks like a broken bus:
+
+  cec_transmit_done()  <- only from adv76xx_cec_tx_raw_status()
+                       <- only from adv76xx_cec_isr()
+                       <- only from adv76xx_isr(), the ISR
+
+With no handler installed, nothing ever calls cec_transmit_done(). Every
+CEC frame is transmitted and acknowledged by the far end, the CEC core is
+never told, and the transmit times out. Logical address allocation cannot
+complete, so the adapter reports
+
+  cec-1-004c: message 00 timed out
+
+and stays Not Allocated even with a valid physical address. Measured on
+this board, the wire is fine in both directions: with the ADV7611 forced
+to logical address 0 and an ADV7511 to 4, a directed poll leaves the
+transmitter's INT1 at 0x20 (CEC_TX_STATUS_OK) and the receiver's IO 0x93
+at 0x01 (TX OK), with zero NACKs and zero low drives each way.
+
+The driver has no polling fallback -- its only delayed_work is for hot
+plug -- so add one, used only when client->irq is 0. The chip's status
+bits latch whether or not they are unmasked onto the pin, so polling them
+does exactly what the interrupt would have caused. A quiet poll is three
+register reads plus one for CEC, and adv76xx_cec_isr() returns at once
+when its status byte is zero; the interval is a module parameter,
+defaulting to 20 ms, which is well inside the CEC core's transmit
+timeout.
+
+The work is started at the end of probe rather than beside the interrupt
+request on purpose: cec_allocate_adapter() runs after that point, and
+adv76xx_cec_isr() dereferences state->cec_adap.
+
+Each poll first reads one IO register through regmap directly, which does
+not log. If the chip does not answer, the poll says so once and retries
+every second instead of running the ISR: the driver's own register helpers
+log every failed read, and polling a chip that has stopped answering every
+20 ms is 150 lines a second. Measured on this board, that saturates a 115200
+baud console and loses its input, so that not even a reboot could be typed.
+It says so once more when the chip answers again.
+
+Signed-off-by: Howard M. Harte <hharte@magicandroidapps.com>
+
+--- a/drivers/media/i2c/adv7604.c
++++ b/drivers/media/i2c/adv7604.c
+@@ -41,6 +41,11 @@
+ module_param(debug, int, 0644);
+ MODULE_PARM_DESC(debug, "debug level (0-2)");
+ 
++static int poll_interval = 20;
++module_param(poll_interval, int, 0644);
++MODULE_PARM_DESC(poll_interval,
++	"status poll interval in ms when no interrupt is wired (default 20)");
++
+ MODULE_DESCRIPTION("Analog Devices ADV7604/10/11/12 video decoder driver");
+ MODULE_AUTHOR("Hans Verkuil <hans.verkuil@cisco.com>");
+ MODULE_AUTHOR("Mats Randgaard <mats.randgaard@cisco.com>");
+@@ -191,6 +196,8 @@
+ 	struct v4l2_fract aspect_ratio;
+ 	u32 rgb_quantization_range;
+ 	struct delayed_work delayed_work_enable_hotplug;
++	struct delayed_work delayed_work_poll;
++	bool poll_failing;
+ 	bool restart_stdi_once;
+ 
+ 	/* CEC */
+@@ -2273,6 +2280,53 @@
+ 	return handled ? IRQ_HANDLED : IRQ_NONE;
+ }
+ 
++/*
++ * Not every board routes INT1 anywhere. The RK-ZYNQ7100 leaves the ADV7611's
++ * pin 55 unconnected, and the alternate INT2 outputs with it, so there is
++ * nothing to put in the device tree and client->irq is 0.
++ *
++ * That is fatal to CEC rather than merely inconvenient: cec_transmit_done()
++ * is reached only from adv76xx_cec_isr(), inside adv76xx_isr(), so with no
++ * handler every CEC frame is sent and acknowledged on the wire while the CEC
++ * core is never told, and each transmit times out. Logical address allocation
++ * never completes and the adapter is unusable.
++ *
++ * The chip's status bits latch whether or not they are unmasked onto the pin,
++ * so polling them performs exactly the work the interrupt would have caused.
++ * The cost is small: a quiet poll is three register reads plus one for CEC,
++ * and adv76xx_cec_isr() returns immediately when its status byte is zero.
++ *
++ * A chip that stops answering must not flood the log: the register helpers
++ * the ISR uses report every failed read, and at a 20 ms poll that is 150
++ * lines a second. So the poll first reads one register through regmap, which
++ * is silent, and backs off to once a second while that fails.
++ */
++static void adv76xx_poll_work(struct work_struct *work)
++{
++	struct delayed_work *dwork = to_delayed_work(work);
++	struct adv76xx_state *state = container_of(dwork,
++						   struct adv76xx_state,
++						   delayed_work_poll);
++	unsigned int val;
++
++	if (regmap_read(state->regmap[ADV76XX_PAGE_IO], 0x6b, &val) < 0) {
++		if (!state->poll_failing)
++			v4l2_warn(&state->sd,
++				  "status poll: no answer, retrying every second\n");
++		state->poll_failing = true;
++		schedule_delayed_work(&state->delayed_work_poll,
++				      msecs_to_jiffies(1000));
++		return;
++	}
++	if (state->poll_failing)
++		v4l2_info(&state->sd, "status poll: answering again\n");
++	state->poll_failing = false;
++
++	adv76xx_isr(&state->sd, 0, NULL);
++	schedule_delayed_work(&state->delayed_work_poll,
++			      msecs_to_jiffies(poll_interval));
++}
++
+ static int adv76xx_get_edid(struct v4l2_subdev *sd, struct v4l2_edid *edid)
+ {
+ 	struct adv76xx_state *state = to_state(sd);
+@@ -3609,6 +3663,7 @@
+ 
+ 	INIT_DELAYED_WORK(&state->delayed_work_enable_hotplug,
+ 			adv76xx_delayed_work_enable_hotplug);
++	INIT_DELAYED_WORK(&state->delayed_work_poll, adv76xx_poll_work);
+ 
+ 	state->source_pad = state->info->num_dv_ports
+ 			  + (state->info->has_afe ? 2 : 0);
+@@ -3657,11 +3712,19 @@
+ 	if (err)
+ 		goto err_entity;
+ 
++	if (!client->irq) {
++		v4l2_info(sd, "no interrupt wired, polling status every %d ms\n",
++			  poll_interval);
++		schedule_delayed_work(&state->delayed_work_poll,
++				      msecs_to_jiffies(poll_interval));
++	}
++
+ 	return 0;
+ 
+ err_entity:
+ 	media_entity_cleanup(&sd->entity);
+ err_work_queues:
++	cancel_delayed_work(&state->delayed_work_poll);
+ 	cancel_delayed_work(&state->delayed_work_enable_hotplug);
+ err_i2c:
+ 	adv76xx_unregister_clients(state);
+@@ -3684,6 +3747,7 @@
+ 	io_write(sd, 0x6e, 0);
+ 	io_write(sd, 0x73, 0);
+ 
++	cancel_delayed_work_sync(&state->delayed_work_poll);
+ 	cancel_delayed_work_sync(&state->delayed_work_enable_hotplug);
+ 	v4l2_async_unregister_subdev(sd);
+ 	media_entity_cleanup(&sd->entity);
